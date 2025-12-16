@@ -53,9 +53,13 @@ class RosService(RosSender):
             service response
         """
         message_type = type(self.req)
-        if data is None:
-            data = serialize_message(Empty())
-        message = deserialize_message(data, message_type)
+        
+        try:
+            message = deserialize_message(data, message_type)
+        except:
+            message = message_type()
+        
+        data = serialize_message(message)
 
         if not self.cli.service_is_ready():
             self.get_logger().error(
