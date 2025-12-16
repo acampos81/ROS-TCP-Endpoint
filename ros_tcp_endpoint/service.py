@@ -15,7 +15,8 @@
 import rclpy
 import re
 
-from rclpy.serialization import deserialize_message
+from rclpy.serialization import serialize_message, deserialize_message
+from std_msgs.msg import Empty
 
 from .communication import RosSender
 
@@ -52,6 +53,8 @@ class RosService(RosSender):
             service response
         """
         message_type = type(self.req)
+        if data is None:
+            data = serialize_message(Empty())
         message = deserialize_message(data, message_type)
 
         if not self.cli.service_is_ready():
