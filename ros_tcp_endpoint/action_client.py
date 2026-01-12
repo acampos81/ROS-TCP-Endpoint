@@ -110,12 +110,18 @@ class RosActionClient(RosSender):
         try:
             goal_handle = future.result()
         except Exception as exc:  # noqa pylint: disable=broad-except
+            self.tcp_server.unity_tcp_sender.send_action_goal_response(
+                self.action_name, unity_goal_id, False, message=str(exc)
+            )
             self._emit_unity_error(
                 f"Failed to send goal {unity_goal_id} to '{self.action_name}': {exc}"
             )
             return
 
         if not goal_handle.accepted:
+            self.tcp_server.unity_tcp_sender.send_action_goal_response(
+                self.action_name, unity_goal_id, False, message="rejected"
+            )
             self._emit_unity_error(
                 f"Action server '{self.action_name}' rejected goal {unity_goal_id}"
             )
@@ -128,6 +134,9 @@ class RosActionClient(RosSender):
                 "ros_goal_id": ros_goal_id,
             }
             self._ros_goal_lookup[ros_goal_id] = unity_goal_id
+        self.tcp_server.unity_tcp_sender.send_action_goal_response(
+            self.action_name, unity_goal_id, True, ros_goal_id=ros_goal_id
+        )
         self.get_logger().info(
             "Goal %s accepted on %s (ROS id %s)"
             % (unity_goal_id, self.action_name, ros_goal_id)

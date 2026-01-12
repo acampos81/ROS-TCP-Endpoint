@@ -15,6 +15,7 @@ Version 0.8.0 introduces an experimental ROS2 action bridge so Unity experiences
 | SysCommand | Purpose | Next Payload |
 |------------|---------|--------------|
 | `__action_goal` | Unity → ROS: register an action goal (fields: `action_name`, `goal_id`) | `action_type.Goal` bytes |
+| `__action_goal_response` | ROS → Unity: respond to a Unity-sent action goal (fields: `action_name`, `goal_id`, `accepted`, `ros_goal_id`, `message`) | None |
 | `__action_feedback` | Unity → ROS: stream feedback (fields: `action_name`, `goal_id`) | `action_type.Feedback` bytes |
 | `__action_result` | Unity → ROS: complete execution (fields: `action_name`, `goal_id`, `status`) | `action_type.Result` bytes |
 | `__action_cancel` | Unity → ROS: cancel a previously-sent goal (fields: `action_name`, `goal_id`) | None |

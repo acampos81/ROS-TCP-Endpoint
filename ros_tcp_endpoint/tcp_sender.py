@@ -116,6 +116,21 @@ class UnityTcpSender:
         serialized_message = ClientThread.serialize_message(topic, result_msg)
         self.queue.put(b"".join([serialized_header, serialized_message]))
 
+    def send_action_goal_response(
+        self, action_name, goal_id, accepted, ros_goal_id="", message=""
+    ):
+        if self.queue is None:
+            return
+
+        header = SysCommand_ActionGoalResponse()
+        header.goal_id = goal_id
+        header.action_name = action_name
+        header.accepted = bool(accepted)
+        header.ros_goal_id = ros_goal_id or ""
+        header.message = message or ""
+        serialized_header = ClientThread.serialize_command("__action_goal_response", header)
+        self.queue.put(serialized_header)
+
     def send_unity_action_goal_request(self, action_name, goal_id, goal_msg):
         if self.queue is None:
             self.tcp_server.logwarn(
@@ -311,6 +326,14 @@ class SysCommand_Action:
         self.goal_id = ""
         self.status = 0
         self.action_name = ""
+
+class SysCommand_ActionGoalResponse:
+    def __init__(self):
+        self.goal_id = ""
+        self.action_name = ""
+        self.accepted = False
+        self.ros_goal_id = ""
+        self.message = ""
 
 
 class SysCommand_Handshake:
