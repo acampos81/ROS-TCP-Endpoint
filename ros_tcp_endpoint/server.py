@@ -255,6 +255,25 @@ class SysCommands:
 
         self.tcp_server.loginfo("RegisterSubscriber({}, {}) OK".format(topic, message_class))
 
+    def remove_subscriber(self, topic):
+        if topic == "":
+            self.tcp_server.send_unity_error(
+                "Can't unsubscribe from a blank topic name! SysCommand.remove_subscriber({})".format(topic)
+            )
+            return
+
+        old_node = self.tcp_server.subscribers_table.get(topic)
+        if old_node is None:
+            self.tcp_server.send_unity_error(
+                "SysCommand.remove_subscriber - Topic '{}' is not registered".format(topic)
+            )
+            return
+
+        self.tcp_server.unregister_node(old_node)
+        del self.tcp_server.subscribers_table[topic]
+
+        self.tcp_server.loginfo("UnregisterSubscriber({}) OK".format(topic))
+
     def publish(self, topic, message_name, queue_size=10, latch=False):
         if topic == "":
             self.tcp_server.send_unity_error(
