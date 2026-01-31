@@ -18,6 +18,8 @@ import json
 import sys
 import threading
 import importlib
+import time
+from json import JSONDecodeError
 
 from rclpy.node import Node
 from rclpy.parameter import Parameter
@@ -80,6 +82,10 @@ class TcpServer(Node):
         self.pending_srv_id = None
         self.pending_srv_is_request = False
         self.pending_action = None
+        self.executor = None
+        self._executor_lock = threading.RLock()
+        self._last_invalid_handle_log_time = 0.0
+        self._last_rcl_error_log_time = 0.0
 
     def start(self, publishers=None, subscribers=None):
         if publishers is not None:
@@ -135,13 +141,38 @@ class TcpServer(Node):
         action_client.cancel_goal(goal_id)
 
     def handle_syscommand(self, topic, data):
-        function = getattr(self.syscommands, topic[2:])
+        function = getattr(self.syscommands, topic[2:], None)
         if function is None:
             self.send_unity_error("Don't understand SysCommand.'{}'".format(topic))
+            return
+
+        # Syscommand payloads are sent as a length-prefixed UTF-8 JSON blob.
+        # Some commands (e.g. `__topic_list`) may send an empty payload, and some
+        # send a null-terminated string. Be permissive and avoid crashing a client
+        # thread on malformed/empty JSON.
+        message_json = data.decode("utf-8", errors="replace").strip("\x00\r\n\t ")
+        if message_json == "":
+            params = {}
         else:
-            message_json = data.decode("utf-8")[:-1]
-            params = json.loads(message_json)
-            function(**params)
+            try:
+                params = json.loads(message_json)
+            except JSONDecodeError as exc:
+                self.logwarn(
+                    "Dropping syscommand '{}' due to invalid JSON payload (len={}): {}. Error: {}".format(
+                        topic, len(data), repr(message_json[:200]), exc
+                    )
+                )
+                return
+
+        if not isinstance(params, dict):
+            self.logwarn(
+                "Dropping syscommand '{}' because JSON payload is not an object: {}".format(
+                    topic, type(params).__name__
+                )
+            )
+            return
+
+        function(**params)
 
     def loginfo(self, text):
         self.get_logger().info(text)
@@ -170,49 +201,108 @@ class TcpServer(Node):
             + 1
         )
         executor = MultiThreadedExecutor(num_threads)
-
-        executor.add_node(self)
-
-        for ros_node in self.publishers_table.values():
-            executor.add_node(ros_node)
-        for ros_node in self.subscribers_table.values():
-            executor.add_node(ros_node)
-        for ros_node in self.ros_services_table.values():
-            executor.add_node(ros_node)
-        for ros_node in self.unity_services_table.values():
-            executor.add_node(ros_node)
-        for ros_node in self.ros_action_clients.values():
-            executor.add_node(ros_node)
-        for ros_node in self.unity_action_servers.values():
-            executor.add_node(ros_node)
-
         self.executor = executor
-        executor.spin()
+
+        with self._executor_lock:
+            executor.add_node(self)
+
+            for ros_node in self.publishers_table.values():
+                executor.add_node(ros_node)
+            for ros_node in self.subscribers_table.values():
+                executor.add_node(ros_node)
+            for ros_node in self.ros_services_table.values():
+                executor.add_node(ros_node)
+            for ros_node in self.unity_services_table.values():
+                executor.add_node(ros_node)
+            for ros_node in self.ros_action_clients.values():
+                executor.add_node(ros_node)
+            for ros_node in self.unity_action_servers.values():
+                executor.add_node(ros_node)
+
+        # rclpy's executor can raise InvalidHandle if a waitable/node is destroyed
+        # concurrently with wait set construction (e.g., when Unity unregisters and
+        # re-registers pubs/subs/services while spinning). Treat this as a transient
+        # race: log and continue rather than crashing the whole process.
+        try:
+            from rclpy._rclpy_pybind11 import InvalidHandle  # type: ignore
+        except Exception:  # noqa: pylint: disable=broad-except
+            InvalidHandle = ()  # type: ignore
+        try:
+            from rclpy._rclpy_pybind11 import RCLError  # type: ignore
+        except Exception:  # noqa: pylint: disable=broad-except
+            RCLError = ()  # type: ignore
+
+        while rclpy.ok():
+            try:
+                with self._executor_lock:
+                    executor.spin_once(timeout_sec=0.1)
+            except InvalidHandle as exc:  # type: ignore[misc]
+                now = time.time()
+                if now - self._last_invalid_handle_log_time > 5.0:
+                    self._last_invalid_handle_log_time = now
+                    self.logwarn(
+                        "Executor saw InvalidHandle (likely concurrent node/entity destruction); "
+                        "continuing. Error: {}".format(exc)
+                    )
+                continue
+            except RCLError as exc:  # type: ignore[misc]
+                # This can occur when an ActionClient/ActionServer handle is destroyed but the
+                # executor still tries to add it to the wait set (often due to concurrent
+                # unregister/re-register flows from Unity clients).
+                now = time.time()
+                if now - self._last_rcl_error_log_time > 5.0:
+                    self._last_rcl_error_log_time = now
+                    self.logwarn(
+                        "Executor saw RCLError (likely invalid ROS handle during wait set build); "
+                        "continuing. Error: {}".format(exc)
+                    )
+                continue
 
     def unregister_node(self, old_node):
         if old_node is not None:
-            old_node.unregister()
+            # Remove from the executor *before* destroying the node/entities to avoid
+            # races where the executor is still building a wait set using that handle.
             if self.executor is not None:
-                self.executor.remove_node(old_node)
+                with self._executor_lock:
+                    try:
+                        self.executor.remove_node(old_node)
+                    except Exception as exc:  # noqa: pylint: disable=broad-except
+                        self.logwarn(
+                            "Failed to remove node from executor during unregister; "
+                            "continuing. Error: {}".format(exc)
+                        )
+            try:
+                old_node.unregister()
+            except Exception as exc:  # noqa: pylint: disable=broad-except
+                self.logwarn(
+                    "Failed to unregister/destroy node; continuing. Error: {}".format(exc)
+                )
 
     def destroy_nodes(self):
         """
             Clean up all of the nodes
         """
-        for ros_node in self.publishers_table.values():
-            ros_node.destroy_node()
-        for ros_node in self.subscribers_table.values():
-            ros_node.destroy_node()
-        for ros_node in self.ros_services_table.values():
-            ros_node.destroy_node()
-        for ros_node in self.unity_services_table.values():
-            ros_node.destroy_node()
-        for ros_node in self.ros_action_clients.values():
-            ros_node.destroy_node()
-        for ros_node in self.unity_action_servers.values():
-            ros_node.destroy_node()
+        for ros_node in list(self.publishers_table.values()):
+            self.unregister_node(ros_node)
+        for ros_node in list(self.subscribers_table.values()):
+            self.unregister_node(ros_node)
+        for ros_node in list(self.ros_services_table.values()):
+            self.unregister_node(ros_node)
+        for ros_node in list(self.unity_services_table.values()):
+            self.unregister_node(ros_node)
+        for ros_node in list(self.ros_action_clients.values()):
+            self.unregister_node(ros_node)
+        for ros_node in list(self.unity_action_servers.values()):
+            self.unregister_node(ros_node)
 
-        self.destroy_node()
+        self.publishers_table.clear()
+        self.subscribers_table.clear()
+        self.ros_services_table.clear()
+        self.unity_services_table.clear()
+        self.ros_action_clients.clear()
+        self.unity_action_servers.clear()
+
+        self.unregister_node(self)
 
 
 class SysCommands:
@@ -251,7 +341,8 @@ class SysCommands:
         new_subscriber = RosSubscriber(topic, message_class, self.tcp_server)
         self.tcp_server.subscribers_table[topic] = new_subscriber
         if self.tcp_server.executor is not None:
-            self.tcp_server.executor.add_node(new_subscriber)
+            with self.tcp_server._executor_lock:
+                self.tcp_server.executor.add_node(new_subscriber)
 
         self.tcp_server.loginfo("RegisterSubscriber({}, {}) OK".format(topic, message_class))
 
@@ -298,7 +389,8 @@ class SysCommands:
 
         self.tcp_server.publishers_table[topic] = new_publisher
         if self.tcp_server.executor is not None:
-            self.tcp_server.executor.add_node(new_publisher)
+            with self.tcp_server._executor_lock:
+                self.tcp_server.executor.add_node(new_publisher)
 
         self.tcp_server.loginfo("RegisterPublisher({}, {}) OK".format(topic, message_class))
 
@@ -327,7 +419,8 @@ class SysCommands:
 
         self.tcp_server.ros_services_table[topic] = new_service
         if self.tcp_server.executor is not None:
-            self.tcp_server.executor.add_node(new_service)
+            with self.tcp_server._executor_lock:
+                self.tcp_server.executor.add_node(new_service)
 
         self.tcp_server.loginfo("RegisterRosService({}, {}) OK".format(topic, message_class))
 
@@ -357,7 +450,8 @@ class SysCommands:
 
         self.tcp_server.unity_services_table[topic] = new_service
         if self.tcp_server.executor is not None:
-            self.tcp_server.executor.add_node(new_service)
+            with self.tcp_server._executor_lock:
+                self.tcp_server.executor.add_node(new_service)
 
         self.tcp_server.loginfo("RegisterUnityService({}, {}) OK".format(topic, message_class))
 
@@ -391,7 +485,8 @@ class SysCommands:
         new_client = RosActionClient(action_name, action_class, self.tcp_server)
         self.tcp_server.ros_action_clients[action_name] = new_client
         if self.tcp_server.executor is not None:
-            self.tcp_server.executor.add_node(new_client)
+            with self.tcp_server._executor_lock:
+                self.tcp_server.executor.add_node(new_client)
 
         self.tcp_server.loginfo("RegisterRosAction({}, {}) OK".format(action_name, action_class))
 
@@ -425,7 +520,8 @@ class SysCommands:
         new_server = UnityActionServer(action_name, action_class, self.tcp_server)
         self.tcp_server.unity_action_servers[action_name] = new_server
         if self.tcp_server.executor is not None:
-            self.tcp_server.executor.add_node(new_server)
+            with self.tcp_server._executor_lock:
+                self.tcp_server.executor.add_node(new_server)
 
         self.tcp_server.loginfo("RegisterUnityAction({}, {}) OK".format(action_name, action_class))
 
